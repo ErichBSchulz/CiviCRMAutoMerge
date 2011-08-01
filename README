@@ -1,0 +1,7 @@
+This allows to automatically merge two contacts in civicrm if that's safe to do, or return an error if it can't be done automatically (eg if there is some collision on fields).
+
+It moves all the related entities (phone, emails...) to the merged contact. 
+
+The aim is to add this code into the core (probably as a contact.merge API). Work in progress, but code already usable.
+
+
