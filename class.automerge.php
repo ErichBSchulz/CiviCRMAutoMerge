@@ -3,8 +3,8 @@
 // [/agc_vim] 
 /**
 * @file
-*   Work in progrogress
-*   @author Erich Schulz
+*   Work in progress
+*   @author Erich Schulz (with help gratefully received from Xavier)
 *   given to the universe under the same licence as CiviCRM
 */
 
@@ -13,11 +13,14 @@
  * Class to automatically merge known duplicate contacts.
  *
  * The goal of these functions is to be simple but safe.
+ *
  * Complex merges are rejected ('blocked') and will need handling through the UI
  *
- * The primary interfaces into the class are:
- *  - reportHtml() - start here when trying to understand what the class does
- *  - autoMergeSQL() - generate either the SQL to perform a merge, or a report explaining why the automerge is unsafe
+ * The primary interface into the class is AgcAutoMerge::autoMergeSQL() which generates either:
+ *    - the SQL to perform a merge, or 
+ *    - a report explaining why the automerge is unsafe
+ *  
+ * Use AgcAutoMergeDevWindow::reportHtml() to see the internal workings 
  *
  *  getContactKeyFields() scans the database to build a list of columns referencing contact_id
  *    - using the table information_schema.COLUMNS and
@@ -40,11 +43,14 @@
  *
  * TODO:  Define the automerge behaviour of tables and fields in the datadictionary then...
  * TODO:  Rewrite the *_list functions and the columnAutomergeBehaviour functions to read the datadictionary 
- * TODO:  Rewrite schema() to use correct setting 
- * TODO:  db_query needs to be replaced with civicrm equivilant!
  * TODO:  ideally this should be undoable - achievable if a list of updates is made and stored as a note attached to the 'deleted' contact
  */
+
 class AgcAutoMerge {
+
+ /****************************************************************************/
+ /* report class warmings, behaviour, limitations and settings */
+ /****************************************************************************/
 
   /**
    * Give user-oriented warning report 
@@ -54,90 +60,32 @@ class AgcAutoMerge {
     return 'Make sure the records you are about to automatically merge true duplicates!!  The checks this function performs only concern the feasability of automatically merging without loss of valuable data - the checks are NOT about verifying you have a true match.';
   }
 
-  /**
-   * Give a detailed report on the proposed merger of two contacts.
-   * This function's role is to support debugging and development of the AutoMerge class.
-   * Injection attack safe but does not check permissions.
-   * @param $mainID integer contact_id of record to keep (injection attack safe)
-   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
-   * @returns string html
-   */
-  static function reportHtml($mainId, $otherId) {
-    $keep = (int)$mainId;
-    $lose = (int)$otherId;
-    return AgcAutoMerge::explainPlanHtml($keep, $lose) . 
-      '<p>(The above explains how the folowing plan was constructed).</p></hr>' .
-      AgcAutoMerge::showPlanHtml($keep, $lose) .
-      "<h4>Settings</h4>" . // show configuration
-        json_encode(AgcAutoMerge::settings());
-  } 
-  
-  /**
-   * Explore and explain the logic behind the proposed merger of two contacts.
-   * This function's role is to support debugging and development of the AutoMerge class.
-   * Injection attack safe but does not check permissions.
-   * @param $mainID integer contact_id of record to keep (injection attack safe)
-   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
-   * @returns string html
-   */
-  static function explainPlanHtml($mainId, $otherId) {
-    $keep = (int)$mainId;
-    $lose = (int)$otherId;
-    $html = "<h3>List of tables containing $lose</h3>";
-    $fields =  AgcAutoMerge::locate($lose);
-    $html .= AgcAutoMerge::arrayFormat($fields,'sol');
-    $plan =  AgcAutoMerge::tablePlan($lose);
-    $html .= "<h3>Planning merge of $lose into $keep</h3>";
-    if ($plan['examine']) {
-      $html .= "<h4>Tables to examine field by field</h4>" . AgcAutoMerge::arrayFormat($plan['examine'],'sol');
-      foreach ($plan['examine'] as $key) {
-        $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-        $field = AgcAutoMerge::field($key); // = field_name
-        $html .= "<h5>Examining table: $table</h5>" .
-          AgcAutoMerge::arrayFormat(
-            AgcAutoMerge::examineRecord($table, $field, $keep, $lose),'sul');
-        // report on actual function used to do the final check within autoMergeSQL()
-        $final_check = AgcAutoMerge::CheckTwoRecordsForBlocksSQL($table,$field, $keep, $lose);
-        $html .= "<p>In summary: " .($final_check ? $final_check : "no blocks found on examination of $table") .  "</p>";
-      }
-    }
-    if ($plan['update']) {
-      $html .= "<h4>Tables to update (move to kept record)</h4>" .
-          AgcAutoMerge::arrayFormat($plan['update'],'sol');
-    }
-    if ($plan['delete']) {
-      $html .= "<h4>Delete records in these tables</h4>" . AgcAutoMerge::arrayFormat($plan['delete'],'sol');
-    }
-    if ($plan['blockers']) {
-      $html .= "<h4>Tables containing records blocking merge</h4>" . AgcAutoMerge::arrayFormat($plan['blockers'],'sol').'<hr>';
-    }
-  return $html;
+ /**
+  * Produces a list of settings. 
+  * These settings change the behaviour of this class and should be viewable by the user.
+  * @return array
+  */
+  public function settings() {
+    return array( 
+      'userWarning' => AgcAutoMerge::userWarning(),
+      'schema' => AgcAutoMerge::schema(),
+      'includeColumnsSQL' => AgcAutoMerge::includeColumnsSQL(),
+      'ignoreColumnsSQL' => AgcAutoMerge::ignoreColumnsSQL(),
+      'excludeEntitiesSQLList' => AgcAutoMerge::excludeEntitiesSQLList(),
+    );
   }
 
-  /**
-   * Tests to see there are no blocks to automatically merging two contacts, and reports the SQL to perform the merge.
-   * This function's role is to support debugging and development of the AutoMerge class.
-   * Injection attack safe but does not check permissions.
-   * @param $mainID integer contact_id of record to keep (injection attack safe)
-   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
-   * @returns string html
-   */
-  static function showPlanHtml($mainId, $otherId) {
-    $keep = (int)$mainId;
-    $lose = (int)$otherId;
-    $html = "<h3>Planned merger of $lose into $keep</h3>";
-    $autoMergeSQL =  AgcAutoMerge::autoMergeSQL($keep, $lose);
-    if ($autoMergeSQL['is_error']) {
-      $html .= "<h4>Error</h4><p class='error'>$autoMergeSQL[error_message]</p><p>$autoMergeSQL[report]</p>";
-    } else {
-      $html .= "<h4>SQL:</h4>" . AgcAutoMerge::arrayFormat($autoMergeSQL['sql']);
-    }
-    return $html;
-  }
+ /****************************************************************************/
+ /* core functionality */
+ /****************************************************************************/
 
   /**
    * Attempt to produce SQL to automaticlly merge two contacts.
-   * todo - check both recordes exist and are not deleted
+   * 
+   * First checks both recordes exist and are not deleted, then scans the database looking for affected tables,
+   * then classifies the foreign keys. If no blocks found does a detailed (field by field examination of some tables.
+   * If still no blocks found then produces a the sql to perform the merge.
+   *
    * @param $mainID integer contact_id of record to keep (injection attack safe)
    * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
    * @uses tablePlan()
@@ -149,10 +97,11 @@ class AgcAutoMerge {
     $lose = (int)$otherId;
     $result = array();
     $report = '';
+    // check both records exist:
     $n = AgcAutoMerge::sqlToSingleValue(
       "SELECT count(*) AS value FROM $schema.civicrm_contact WHERE is_deleted = 0 AND id IN ($keep, $lose);");
     switch ($n) {
-      case 2:
+      case 2: // 
         // formulate a table-level plan for merging the contacts:
         $plan = AgcAutoMerge::tablePlan($otherId);
         if ($plan['blockers']) { // records found that are either in unknown tables or tables that need manual review
@@ -205,28 +154,77 @@ class AgcAutoMerge {
     return $result;
   }
 
- /**
-  * Produces a list of settings. 
-  * These settings change the behaviour of this class and should be viewable by the user.
-  * @return array
-  */
-  public function settings() {
-    return array( 
-      'userWarning' => AgcAutoMerge::userWarning(),
-      'schema' => AgcAutoMerge::schema(),
-      'includeColumnsSQL' => AgcAutoMerge::includeColumnsSQL(),
-      'ignoreColumnsSQL' => AgcAutoMerge::ignoreColumnsSQL(),
-      'excludeEntitiesSQLList' => AgcAutoMerge::excludeEntitiesSQLList(),
-    );
+
+  /*
+   * Produces a plan for merging contact, and identifies some of the blocks to an autodedupe
+   * First scans the database for references to the contact then classifies 
+   * those references with:
+   *  - delete_list()
+   *  - update_list()
+   *  - examine_list()
+   * 
+   * Any references to the contact that do not have a plan are added to the 
+   * blocking list.
+   * 
+   * @return array with 3 elements: delete, update and blockers
+   */
+  static public function tablePlan($contact_id) {
+    $schema = AgcAutoMerge::schema();
+    $plan = array();
+    $locations = AgcAutoMerge::locate($contact_id);
+    // classify locations into either for updating or deleting
+    $plan['delete'] = array_intersect($locations, AgcAutoMerge::delete_list($schema));
+    $plan['update'] = array_intersect($locations, AgcAutoMerge::update_list($schema));
+    $plan['examine'] = array_intersect($locations, AgcAutoMerge::examine_list($schema));
+    // any column that doesn't have a plan blocks automerging
+    $plan['blockers'] = array_diff($locations, $plan['delete'],$plan['update'], $plan['examine']);
+    return $plan;
   }
 
+  
+  /**
+   * Produce a list of columns where a given contact_id is found 
+   * 
+   * @uses getFieldList() to identify field to scan in db schema
+   * @return array of (schema_name).(table name).(key field) 
+   */
+  static public function locate($contact_id) {
+    $keys = AgcAutoMerge::getContactKeyFields(true);
+    $locations = array(); // columns $contact_id is found
+    foreach ($keys as $key) {
+      $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
+      $field = AgcAutoMerge::field($key); // = field_name
+      $sql = 
+        "SELECT count(*) AS value FROM $table WHERE $field=".(int)$contact_id.';';
+      $n=AgcAutoMerge::sqlToSingleValue($sql);
+      if ($n) { // contact found!
+        $locations[] = $key;
+      }
+    }
+    return $locations;
+  }
+
+
+ /****************************************************************************/
+ /* settings interface - this section groups all configuration settings */
+ /****************************************************************************/
+
  /**
-  * Database schema we are deduping
+  * Database schema we are deduping, as read from CRM_Core_Config
   * @return string
   */
   public function schema() {
-    return 'au_drupal';  //fixme this should look up correct setting
+    if ( !AgcAutoMerge::$schema ) {
+      civicrm_initialize();
+      //require_once drupal_get_path('module', 'civicrm').'/../api/api.php';
+      $dsn = CRM_Core_Config::singleton()->dsn;
+      // extract mysql database schema name from dsn string:
+      // ie the bit between (the first / after the @) and the question mark
+      AgcAutoMerge::$schema = preg_replace('/^.*@.*\/(.*)\?.*$/', '\1', $dsn);
+    }
+    return AgcAutoMerge::$schema;
   }
+  static private $schema = '';
 
   /**
   * Pattern matching criteria for columns to include in initial scan of schema 
@@ -252,12 +250,19 @@ class AgcAutoMerge {
   public function excludeEntitiesSQLList() {
     return "'Location','Address','Contribution','Activity', 'Relationship','Group', 'Membership','Participant','Event','Grant','Pledge','Case'";
   }
+
+ /****************************************************************************/
+ /* meta data */
+ /****************************************************************************/
+
   /**
   * List of columns to ignore completely while auto deduping.
   * Any reference to redundant contacts are left alone.
   * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
   * @return array of (schema_name).(table name).(key field) 
   */
+ 
+
   public function ignore_list($schema) { 
     return array(
       "$schema.agc_known_duplicates.contact_id_b",
@@ -319,78 +324,7 @@ class AgcAutoMerge {
     );
   }
 
- /**
-  * Make SQL to compare two proposed automerge records and report blocking fields:
-  * @return string SQL that returns a single value listing any blocking columns or NULL if no blocks
-  */
-  public function CheckTwoRecordsForBlocksSQL($table, $key_field, $ida, $idb) { 
-    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
-    $columns = AgcAutoMerge::Describe($short_table_name);
-    $sql = "SELECT CONCAT_WS(', ',\n";
-    foreach ($columns as $column) {
-      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $column);
-      $sql .= '  IF ('.AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $column, $behaviour) . 
-        ", CONCAT('$column /*',ca.$column,'-',cb.$column,'*/'), NULL),\n";
-    }
-    $sql .= "  null) AS value
-    FROM $table AS ca, $table AS cb 
-    WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
-    $value = AgcAutoMerge::sqlToSingleValue($sql);
-    return $value;
-  }
 
- /**
-  * Examines two proposed automerge records and report blocking fields:
-  * The purpose of this function is poorly to allow debugging and testing of merge behaviour.
-  * @return array of field reports: result name [valueA]-[valueB] (test used)
-  */
-  public function examineRecord($table, $key_field, $ida, $idb) { 
-    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
-    $columns = AgcAutoMerge::Describe($short_table_name);
-    $sql = "SELECT ";
-    $columnsSQL = array();
-    foreach ($columns as $c) {
-      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $c);
-      $test = AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $c, $behaviour);
-      $columnsSQL[] = " CONCAT_WS('', IF ($test, 'blocked', 'mergeable'), ' $c: [',ca.$c,']-[',cb.$c,'] ($behaviour)') AS $c";
-    }
-    $sql .= implode(', ', $columnsSQL);
-    $sql .= " FROM $table AS ca, $table AS cb WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
-    $res = db_query($sql);
-    $db_row =  db_fetch_array($res);
-    return $db_row;
-  }
-
-/**
- * SQL clause to tests if automerging values prevents safe automerge
- * These clauses return TRUE if the values block automerger.
- * Tables to compare are aliased by 'ca' and 'cb'.
- * @see columnAutomergeBehaviour()
- * @returns string SQL clause evaluating to TRUE or FALSE if column fails automerge suitability test
- */
-  function automergeSuitablilityTestSQL($table, $column, $behaviour) {
-    $verbose = false; // set true to put debugging comments into SQL
-    $emailRE = '^[0-9a-z_\.-]+@(([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-z][0-9a-z-]*[0-9a-z]\.)+[a-z]{2,3})$';
-    switch ($behaviour) {
-      case 'BlockOnDifferentValue':
-        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'')";
-        break;
-      case 'BlockIfGreater':
-        $sql="IFNULL(cb.$column,0)>IFNULL(ca.$column,0)";
-        break;
-      case 'IgnoreTruncation':
-        $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%')";
-        break;
-      case 'IgnoreEMailOrTruncation':
-        // some fields may contain the emial address by default. This is pretty worthless so shouldn't force an automerge
-        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'') AND cb.$column NOT REGEXP '$emailRE'";
-        break;
-      case 'Ignore':
-        $sql="FALSE";
-        break;
-    }
-    return ($verbose ? "/* $table.$column: $behaviour */\n" : '') . $sql . "\n";
-  }
 /**
  * Determine effect of civicrm_contact columns on an attempted auto merge
  * If encounters an unknown table or column returns the value 'BlockOnDifferentValue'
@@ -416,7 +350,7 @@ class AgcAutoMerge {
           break;
         //case 'sort_name':
         //case 'display_name':
-          $behaviour = 'IgnoreEMailOrTruncation';
+          $behaviour = 'IgnoreEMaiTurrubal, Jagera and YuggeralOrTruncation';
           break;
         case 'sort_name': // todo consider making more sophisticate opotion to compare for hand-crafted values
         case 'display_name': //todo see above
@@ -457,8 +391,67 @@ class AgcAutoMerge {
     return $updates;
   }
 
+     
+ /****************************************************************************/
+ /* implement desired field comparision behaviour  */
+ /****************************************************************************/
 
 
+ /**
+  * Make SQL to compare two proposed automerge records and report blocking fields:
+  * @uses automergeSuitablilityTestSQL()
+  * @return string listing any blocking columns or NULL if no blocks
+  */
+  public function CheckTwoRecordsForBlocksSQL($table, $key_field, $ida, $idb) { 
+    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
+    $columns = AgcAutoMerge::Describe($short_table_name);
+    $sql = "SELECT CONCAT_WS(', ',\n";
+    foreach ($columns as $column) {
+      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $column);
+      $sql .= '  IF ('.AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $column, $behaviour) . 
+        ", CONCAT('$column /*',ca.$column,'-',cb.$column,'*/'), NULL),\n";
+    }
+    $sql .= "  null) AS value
+    FROM $table AS ca, $table AS cb 
+    WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
+    $value = AgcAutoMerge::sqlToSingleValue($sql);
+    return $value;
+  }
+
+/**
+ * SQL clause to tests if automerging values prevents safe automerge
+ * These clauses return TRUE if the values block automerger.
+ * Tables to compare are aliased by 'ca' and 'cb'.
+ * @see columnAutomergeBehaviour()
+ * @returns string SQL clause evaluating to TRUE or FALSE if column fails automerge suitability test
+ */
+  function automergeSuitablilityTestSQL($table, $column, $behaviour) {
+    $verbose = false; // set true to put debugging comments into SQL
+    $emailRE = '^[0-9a-z_\.-]+@(([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-z][0-9a-z-]*[0-9a-z]\.)+[a-z]{2,3})$';
+    switch ($behaviour) {
+      case 'BlockOnDifferentValue':
+        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'')";
+        break;
+      case 'BlockIfGreater':
+        $sql="IFNULL(cb.$column,0)>IFNULL(ca.$column,0)";
+        break;
+      case 'IgnoreTruncation':
+        $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%')";
+        break;
+      case 'IgnoreEMailOrTruncation':
+        // some fields may contain the emial address by default. This is pretty worthless so shouldn't force an automerge
+        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'') AND cb.$column NOT REGEXP '$emailRE'";
+        break;
+      case 'Ignore':
+        $sql="FALSE";
+        break;
+    }
+    return ($verbose ? "/* $table.$column: $behaviour */\n" : '') . $sql . "\n";
+  }
+
+ /****************************************************************************/
+ /* schema reading functions */
+ /****************************************************************************/
 
   /**
    * Access the information_schema to list the columns in a table
@@ -530,6 +523,9 @@ sql;
     }
     return $_SESSION['_agc.dedupefields']; 
   }
+ /****************************************************************************/
+ /* utilities **/
+ /****************************************************************************/
    /**
    * Parse (schema_name).(table name) in (table name)
    * @param string '(schema_name).(table name)' or '(table name)'
@@ -558,38 +554,17 @@ sql;
       $split = explode('.',$long_column_name);
       return $split[2]; // = field 
   }
-  
-  /**
-   * Produce a list of columns where a given contact_id is found 
-   * 
-   * @uses getFieldList() to identify field to scan in db schema
-   * @return array of (schema_name).(table name).(key field) 
-   */
-  static public function locate($contact_id) {
-    $keys = AgcAutoMerge::getContactKeyFields(true);
-    $locations = array(); // columns $contact_id is found
-    foreach ($keys as $key) {
-      $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-      $field = AgcAutoMerge::field($key); // = field_name
-      $sql = 
-        "SELECT count(*) AS value FROM $table WHERE $field=".(int)$contact_id.';';
-      $n=AgcAutoMerge::sqlToSingleValue($sql);
-      if ($n) { // contact found!
-        $locations[] = $key;
-      }
-    }
-    return $locations;
-  }
 
   /**
    * Convert SQL to a single value 
    * @param string $sql with field 'value'
-   * @return string|number
+   * @return string|number 
    */
   static protected function sqlToSingleValue($sql) {
-    $res=db_query($sql);
-    $db_row =  db_fetch_object($res);
-    return $db_row->value;
+    $res=CRM_Core_DAO::executeQuery($sql);
+    if ($res->fetch()) {
+      return $res->value;
+    }
   }
   /**
    * Convert SQL into a one dimension array with numeric keys
@@ -597,38 +572,121 @@ sql;
    * @return array
    */
   static protected function sqlToArray($sql) {
-    $res=db_query($sql);
+    $res=CRM_Core_DAO::executeQuery($sql);
     $oneD = array();
-    while ( $db_row =  db_fetch_object($res)) {
-      $oneD[] = $db_row->value;
+    while ( $res->fetch()) {
+      $oneD[] = $res->value;
     }
     return $oneD;
   }
+}
 
-  /*
-   * Produces a plan for merging contact, and identifies some of the blocks to an autodedupe
-   * First scans the database for references to the contact then classifies 
-   * those references with:
-   *  - delete_list()
-   *  - update_list()
-   *  - examine_list()
-   * 
-   * Any references to the contact that do not have a plan are added to the 
-   * blocking list.
-   * 
-   * @return array with 3 elements: delete, update and blockers
+
+/**
+ * This class's role is to support debugging and development of the AutoMerge class.
+ */
+class AgcAutoMergeDevWindow {
+
+  /**
+   * Give a detailed report on the proposed merger of two contacts.
+   * Injection attack safe but does not check permissions.
+   * @param $mainID integer contact_id of record to keep (injection attack safe)
+   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
+   * @returns string html
    */
-  static public function tablePlan($contact_id) {
-    $schema = AgcAutoMerge::schema();
-    $plan = array();
-    $locations = AgcAutoMerge::locate($contact_id);
-    // classify locations into either for updating or deleting
-    $plan['delete'] = array_intersect($locations, AgcAutoMerge::delete_list($schema));
-    $plan['update'] = array_intersect($locations, AgcAutoMerge::update_list($schema));
-    $plan['examine'] = array_intersect($locations, AgcAutoMerge::examine_list($schema));
-    // any column that doesn't have a plan blocks automerging
-    $plan['blockers'] = array_diff($locations, $plan['delete'],$plan['update'], $plan['examine']);
-    return $plan;
+  static function reportHtml($mainId, $otherId) {
+    $keep = (int)$mainId;
+    $lose = (int)$otherId;
+    return AgcAutoMergeDevWindow::explainPlanHtml($keep, $lose) . 
+      '<p>(The above explains how the folowing plan was constructed).</p></hr>' .
+      AgcAutoMergeDevWindow::showPlanHtml($keep, $lose) .
+      "<h4>Settings</h4>" . // show configuration
+        json_encode(AgcAutoMerge::settings());
+  } 
+  
+  /**
+   * Explore and explain the logic behind the proposed merger of two contacts.
+   * Injection attack safe but does not check permissions.
+   * @param $mainID integer contact_id of record to keep (injection attack safe)
+   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
+   * @returns string html
+   */
+  static function explainPlanHtml($mainId, $otherId) {
+    $keep = (int)$mainId;
+    $lose = (int)$otherId;
+    $html = "<h3>List of tables containing $lose</h3>";
+    $fields =  AgcAutoMerge::locate($lose);
+    $html .= AgcAutoMergeDevWindow::arrayFormat($fields,'sol');
+    $plan =  AgcAutoMerge::tablePlan($lose);
+    $html .= "<h3>Planning merge of $lose into $keep</h3>";
+    if ($plan['examine']) {
+      $html .= "<h4>Tables to examine field by field</h4>" . AgcAutoMergeDevWindow::arrayFormat($plan['examine'],'sol');
+      foreach ($plan['examine'] as $key) {
+        $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
+        $field = AgcAutoMerge::field($key); // = field_name
+        $html .= "<h5>Examining table: $table</h5>" .
+          AgcAutoMergeDevWindow::arrayFormat(
+            AgcAutoMergeDevWindow::examineRecord($table, $field, $keep, $lose),'sul');
+        // report on actual function used to do the final check within autoMergeSQL()
+        $final_check = AgcAutoMerge::CheckTwoRecordsForBlocksSQL($table,$field, $keep, $lose);
+        $html .= "<p>In summary: " .($final_check ? $final_check : "no blocks found on examination of $table") .  "</p>";
+      }
+    }
+    if ($plan['update']) {
+      $html .= "<h4>Tables to update (move to kept record)</h4>" .
+          AgcAutoMergeDevWindow::arrayFormat($plan['update'],'sol');
+    }
+    if ($plan['delete']) {
+      $html .= "<h4>Delete records in these tables</h4>" . AgcAutoMergeDevWindow::arrayFormat($plan['delete'],'sol');
+    }
+    if ($plan['blockers']) {
+      $html .= "<h4>Tables containing records blocking merge</h4>" . AgcAutoMergeDevWindow::arrayFormat($plan['blockers'],'sol').'<hr>';
+    }
+  return $html;
+  }
+
+  /**
+   * Tests to see there are no blocks to automatically merging two contacts, and reports the SQL to perform the merge.
+   * Injection attack safe but does not check permissions.
+   * @param $mainID integer contact_id of record to keep (injection attack safe)
+   * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
+   * @returns string html
+   */
+  static function showPlanHtml($mainId, $otherId) {
+    $keep = (int)$mainId;
+    $lose = (int)$otherId;
+    $html = "<h3>Planned merger of $lose into $keep</h3>";
+    $autoMergeSQL =  AgcAutoMerge::autoMergeSQL($keep, $lose);
+    if ($autoMergeSQL['is_error']) {
+      $html .= "<h4>Error</h4><p class='error'>$autoMergeSQL[error_message]</p><p>$autoMergeSQL[report]</p>";
+    } else {
+      $html .= "<h4>SQL:</h4>" . AgcAutoMergeDevWindow::arrayFormat($autoMergeSQL['sql']);
+    }
+    return $html;
+  }
+
+ /**
+  * Examines two proposed automerge records and report blocking fields:
+  * The purpose of this function is purely to allow debugging and testing of merge behaviour.
+  * @return array of field reports: result name [valueA]-[valueB] (test used)
+  */
+  public function examineRecord($table, $key_field, $ida, $idb) { 
+    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
+    $columns = AgcAutoMerge::Describe($short_table_name);
+    $sql = "SELECT ";
+    $columnsSQL = array();
+    foreach ($columns as $c) {
+      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $c);
+      $test = AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $c, $behaviour);
+      $columnsSQL[] = " CONCAT_WS('', IF ($test, 'blocked', 'mergeable'), ' $c: [',ca.$c,']-[',cb.$c,'] ($behaviour)') AS $c";
+    }
+    $sql .= implode(', ', $columnsSQL);
+    $sql .= " FROM $table AS ca, $table AS cb WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
+    $res = CRM_Core_DAO::executeQuery($sql);
+    $res->fetch();
+    // fixme: this following line throws in a few extra properties and isn't a clean swayp for drupal's db_fetch_array()
+    $db_row =  (array)$res;
+    return $db_row;
   }
 
    /**
@@ -653,5 +711,3 @@ sql;
         return 'bad mode in agchtml::arrayFormat';}
   }
 }
-
-
