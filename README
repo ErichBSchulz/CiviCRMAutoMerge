@@ -1,7 +1,9 @@
-This allows to automatically merge two contacts in civicrm if that's safe to do, or return an error if it can't be done automatically (eg if there is some collision on fields).
+This class generates an sql script to automatically merge two contacts in civicrm if the merge is safe to do without human review. Otherwise it returns an error message explaining why the merge can't be done automatically (eg if there is some collision on fields).
 
 It moves all the related entities (phone, emails...) to the merged contact. 
 
 The aim is to add this code into the core (probably as a contact.merge API). Work in progress, but code already usable.
 
+Currently this code is in pre-alpha testing, so use with extreme caution and review the warnings!
 
+see further discussion at http://forum.civicrm.org/index.php/topic,8101.0.html
