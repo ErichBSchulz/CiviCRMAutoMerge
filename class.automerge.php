@@ -41,9 +41,16 @@
  * The purpose of this blocking is to trigger a traditional human overseen merge process, ie
  * blocking an automerge doesn't mean two concepts cannot be merged, but merely that the process requires human oversight.
  *
+ * COMPOUND KEYS
+ * $_SESSION['_agc.compound_key_partners'] is an array where the index is a compound key referencing civcrm_contact.id.
+ *  The value of this array is field name of the secondary column that indicates when the reference is to a contact.
+ *
  * TODO:  Define the automerge behaviour of tables and fields in the datadictionary then...
  * TODO:  Rewrite the *_list functions and the columnAutomergeBehaviour functions to read the datadictionary 
  * TODO:  ideally this should be undoable - achievable if a list of updates is made and stored as a note attached to the 'deleted' contact
+ * TODO:  Eliminate use of direct $_SESSION access
+ * TODO:  Make the MySQL schema scan an optional action
+ * TODO:  Make parameters configurable
  */
 
 class AgcAutoMerge {
@@ -63,6 +70,7 @@ class AgcAutoMerge {
  /**
   * Produces a list of settings. 
   * These settings change the behaviour of this class and should be viewable by the user.
+  * todo most of these parameters should be pulled out into configurable settings
   * @return array
   */
   public function settings() {
@@ -92,14 +100,14 @@ class AgcAutoMerge {
    * @return array result including SQL
    */
   static public function autoMergeSQL($mainId, $otherId) {
-    $schema = AgcAutoMerge::schema();
     $keep = (int)$mainId;
     $lose = (int)$otherId;
     $result = array();
+    $result['is_error'] = 0;
     $report = '';
     // check both records exist:
     $n = AgcAutoMerge::sqlToSingleValue(
-      "SELECT count(*) AS value FROM $schema.civicrm_contact WHERE is_deleted = 0 AND id IN ($keep, $lose);");
+      "SELECT count(*) AS value FROM civicrm_contact WHERE is_deleted = 0 AND id IN ($keep, $lose);");
     switch ($n) {
       case 2: // 
         // formulate a table-level plan for merging the contacts:
@@ -109,11 +117,10 @@ class AgcAutoMerge {
           $result['error_message']='Sorry, unable to automatically merge.';
           $report.= "Found references to $otherId in the following table(s): " . 
             implode(', ', $plan['blockers']) . '.';
-        } else { // no blocking records found
-          $sql = array();
-          foreach ($plan['examine'] as $key) {
-            $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-            $field = AgcAutoMerge::field($key); // = field_name
+        } else { // no records found in blocking tables, 
+          foreach ($plan['examine'] as $key) { // examine selected tables field by field 
+            $table = AgcAutoMerge::tableFromColumnRef($key); 
+            $field = AgcAutoMerge::field($key); 
             $blockers = AgcAutoMerge::CheckTwoRecordsForBlocksSQL($table,$field, $keep, $lose);
             if ($blockers) {
               $result['is_error'] = 1;
@@ -121,24 +128,28 @@ class AgcAutoMerge {
               $report.= "Incompatible fields found in $table ($blockers)";
             }
           }
-          foreach ($plan['update'] as $key) {
-            $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-            $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
-            $updates = AgcAutoMerge::tableAutomergeUpdates($short_table_name);
-            if ($updates) {
-              $updates = ", $updates";
+          if (!$result['is_error']) { // we are safe to merge!
+            $sql = array();
+            foreach ($plan['update'] as $key) {
+              $table = AgcAutoMerge::tableFromColumnRef($key); 
+              $field = AgcAutoMerge::field($key); 
+              // build list of fields to update during transfer to new contact
+              $updates = AgcAutoMerge::tableAutomergeUpdates($table);
+              if ($updates) {
+                $updates = ", $updates";
+              }
+              $where = AgcAutoMerge::whereClauseSQL($lose, $table, $field);
+              $sql[] = "UPDATE $table SET $field = $keep$updates WHERE $where;";
             }
-            $field = AgcAutoMerge::field($key); // = field_name
-            $sql[] = "UPDATE $table SET $field = $keep$updates WHERE $field = $lose;";
+            foreach ($plan['delete'] as $key) {
+              $table = AgcAutoMerge::tableFromColumnRef($key);
+              $field = AgcAutoMerge::field($key);
+              $where = AgcAutoMerge::whereClauseSQL($lose, $table, $field);
+              $sql[] = "DELETE FROM $table WHERE $where;";
+            }
+            $sql[]="UPDATE civicrm_contact SET is_deleted = 1 WHERE id = $lose;";
+            $result['sql'] = $sql;
           }
-          foreach ($plan['delete'] as $key) {
-            $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-            $field = AgcAutoMerge::field($key); // = field_name
-            $sql[] = "DELETE FROM $table WHERE $field = $lose;";
-          }
-          $sql[]="UPDATE $schema.civicrm_contact SET is_deleted = 1 WHERE $field = $lose;";
-          $result['is_error'] = 0;
-          $result['sql'] = $sql;
         }
         break;
       case 1:
@@ -169,13 +180,12 @@ class AgcAutoMerge {
    * @return array with 3 elements: delete, update and blockers
    */
   static public function tablePlan($contact_id) {
-    $schema = AgcAutoMerge::schema();
     $plan = array();
     $locations = AgcAutoMerge::locate($contact_id);
     // classify locations into either for updating or deleting
-    $plan['delete'] = array_intersect($locations, AgcAutoMerge::delete_list($schema));
-    $plan['update'] = array_intersect($locations, AgcAutoMerge::update_list($schema));
-    $plan['examine'] = array_intersect($locations, AgcAutoMerge::examine_list($schema));
+    $plan['delete'] = array_intersect($locations, AgcAutoMerge::delete_list());
+    $plan['update'] = array_intersect($locations, AgcAutoMerge::update_list());
+    $plan['examine'] = array_intersect($locations, AgcAutoMerge::examine_list());
     // any column that doesn't have a plan blocks automerging
     $plan['blockers'] = array_diff($locations, $plan['delete'],$plan['update'], $plan['examine']);
     return $plan;
@@ -192,10 +202,11 @@ class AgcAutoMerge {
     $keys = AgcAutoMerge::getContactKeyFields(true);
     $locations = array(); // columns $contact_id is found
     foreach ($keys as $key) {
-      $table = AgcAutoMerge::tableFromColumnRef($key); // = schema.table
-      $field = AgcAutoMerge::field($key); // = field_name
+      $table = AgcAutoMerge::tableFromColumnRef($key);
+      $field = AgcAutoMerge::field($key); 
+      $where = AgcAutoMerge::whereClauseSQL($contact_id, $table, $field);
       $sql = 
-        "SELECT count(*) AS value FROM $table WHERE $field=".(int)$contact_id.';';
+        "SELECT count(*) AS value FROM $table WHERE $where;";
       $n=AgcAutoMerge::sqlToSingleValue($sql);
       if ($n) { // contact found!
         $locations[] = $key;
@@ -214,17 +225,17 @@ class AgcAutoMerge {
   * @return string
   */
   public function schema() {
-    if ( !AgcAutoMerge::$schema ) {
+    static $schema = '';
+    if ( !$schema ) {
       civicrm_initialize();
       //require_once drupal_get_path('module', 'civicrm').'/../api/api.php';
       $dsn = CRM_Core_Config::singleton()->dsn;
       // extract mysql database schema name from dsn string:
       // ie the bit between (the first / after the @) and the question mark
-      AgcAutoMerge::$schema = preg_replace('/^.*@.*\/(.*)\?.*$/', '\1', $dsn);
+      $schema = preg_replace('/^.*@.*\/(.*)\?.*$/', '\1', $dsn);
     }
-    return AgcAutoMerge::$schema;
+    return $schema;
   }
-  static private $schema = '';
 
   /**
   * Pattern matching criteria for columns to include in initial scan of schema 
@@ -259,68 +270,66 @@ class AgcAutoMerge {
   * List of columns to ignore completely while auto deduping.
   * Any reference to redundant contacts are left alone.
   * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
-  * @return array of (schema_name).(table name).(key field) 
+  * @return array of (table name).(key field) 
   */
- 
-
-  public function ignore_list($schema) { 
+  public function ignore_list() { 
     return array(
-      "$schema.agc_known_duplicates.contact_id_b",
-      "$schema.civicrm_value_electorates.entity_id",
-      "$schema.ems_geocode_addr_electorate.contact_id",
-      "$schema.ems_regeocode.contact_id",
-      "$schema.agc_known_duplicates.contact_id_a",
-      "$schema.civicrm_log.entity_id", 
+      "agc_known_duplicates.contact_id_b",
+      "civicrm_value_electorates.entity_id",
+      "ems_geocode_addr_electorate.contact_id",
+      "ems_regeocode.contact_id",
+      "agc_known_duplicates.contact_id_a",
+      "civicrm_log.entity_id", 
     );
   }
  /**
   * List of columns where a duplicate id should trigger a record delete during automated merging
   * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
   *
-  * @return array of (schema_name).(table name).(key field) 
+  * @return array of (table name).(key field) 
   */
-  public function delete_list($schema) { 
+  public function delete_list() { 
     return array(
-      "$schema.agc_intray_matches.contact_id",
+      "agc_intray_matches.contact_id",
     );
   }
  /**
   * List of columns that it is safe to update during an automated merge:
   * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
-  * @return array of (schema_name).(table name).(key field) 
+  * @return array of (table name).(key field) 
   */
-  public function update_list($schema) { 
+  public function update_list() { 
     return array(
-      "$schema.civicrm_activity.source_contact_id",
-      "$schema.civicrm_activity_target.target_contact_id",
-      "$schema.civicrm_email.contact_id",
-      "$schema.civicrm_entity_tag.entity_id",
-      "$schema.civicrm_group_contact.contact_id",
-      "$schema.civicrm_mailing_event_queue.contact_id",
-      "$schema.civicrm_participant.contact_id",
-      "$schema.civicrm_subscription_history.contact_id",
-      "$schema.civicrm_activity_assignment.assignee_contact_id",
-      "$schema.civicrm_address.contact_id",
-      "$schema.civicrm_contribution.contact_id",
-      "$schema.civicrm_dashboard_contact.contact_id",
-      "$schema.civicrm_mailing_event_subscribe.contact_id",
-      "$schema.civicrm_note.contact_id",
-      "$schema.civicrm_phone.contact_id",
-      "$schema.civicrm_preferences.contact_id",
-      "$schema.civicrm_uf_match.contact_id",
-      "$schema.civicrm_value_fundraising_appeals_59.contact_id_298",
-      "$schema.ems_geocode_addr_electorate.contact_id  ",
+      "civicrm_activity.source_contact_id",
+      "civicrm_activity_target.target_contact_id",
+      "civicrm_email.contact_id",
+      "civicrm_entity_tag.entity_id",
+      "civicrm_group_contact.contact_id",
+      "civicrm_mailing_event_queue.contact_id",
+      "civicrm_participant.contact_id",
+      "civicrm_subscription_history.contact_id",
+      "civicrm_activity_assignment.assignee_contact_id",
+      "civicrm_address.contact_id",
+      "civicrm_contribution.contact_id",
+      "civicrm_dashboard_contact.contact_id",
+      "civicrm_mailing_event_subscribe.contact_id",
+      "civicrm_note.contact_id",
+      "civicrm_phone.contact_id",
+      "civicrm_preferences.contact_id",
+      "civicrm_uf_match.contact_id",
+      "civicrm_value_fundraising_appeals_59.contact_id_298",
+      "ems_geocode_addr_electorate.contact_id  ",
     );
 
   }
  /**
   * List of key columns where the entire record needs field by field examination  
   * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
-  * @return array of (schema_name).(table name).(key field) 
+  * @return array of (table name).(key field) 
   */
-  public function examine_list($schema) { 
+  public function examine_list() { 
     return array(
-      "$schema.civicrm_contact.id"
+      "civicrm_contact.id"
     );
   }
 
@@ -344,6 +353,8 @@ class AgcAutoMerge {
           $behaviour = 'BlockIfGreater';
           break;
         case 'first_name':
+          $behaviour = 'AllowSingleCharBlankOrMatch';
+          break;
         case 'middle_name':
         case 'last_name':
           $behaviour = 'IgnoreTruncation';
@@ -372,6 +383,7 @@ class AgcAutoMerge {
     return $behaviour;
   }
 
+ 
 /**
  * Provides an update clause for a table
  * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
@@ -403,25 +415,29 @@ class AgcAutoMerge {
   * @return string listing any blocking columns or NULL if no blocks
   */
   public function CheckTwoRecordsForBlocksSQL($table, $key_field, $ida, $idb) { 
-    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
-    $columns = AgcAutoMerge::Describe($short_table_name);
+    $columns = AgcAutoMerge::Describe($table);
     $sql = "SELECT CONCAT_WS(', ',\n";
     foreach ($columns as $column) {
-      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $column);
-      $sql .= '  IF ('.AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $column, $behaviour) . 
+      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($table, $column);
+      $sql .= '  IF ('.AgcAutoMerge::automergeSuitablilityTestSQL($table, $column, $behaviour) . 
         ", CONCAT('$column /*',ca.$column,'-',cb.$column,'*/'), NULL),\n";
     }
     $sql .= "  null) AS value
     FROM $table AS ca, $table AS cb 
-    WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
+    WHERE " .
+      AgcAutoMerge::whereClauseSQL($ida, $table, $key_field, 'ca') . ' AND ' .
+      AgcAutoMerge::whereClauseSQL($idb, $table, $key_field, 'cb') . ';';
     $value = AgcAutoMerge::sqlToSingleValue($sql);
     return $value;
   }
 
 /**
- * SQL clause to tests if automerging values prevents safe automerge
+ * SQL clause to test if automerging values prevents safe automerge
+ *
  * These clauses return TRUE if the values block automerger.
+ * 
  * Tables to compare are aliased by 'ca' and 'cb'.
+ *
  * @see columnAutomergeBehaviour()
  * @returns string SQL clause evaluating to TRUE or FALSE if column fails automerge suitability test
  */
@@ -437,6 +453,10 @@ class AgcAutoMerge {
         break;
       case 'IgnoreTruncation':
         $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%')";
+        break;
+      case 'AllowSingleCharBlankOrMatch':
+        $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%') 
+                AND UPPER(SUBSTR(ca.$column,1,1))<>UPPER(cb.$column)";
         break;
       case 'IgnoreEMailOrTruncation':
         // some fields may contain the emial address by default. This is pretty worthless so shouldn't force an automerge
@@ -473,7 +493,7 @@ sql;
   }
 
   /**
-   * Access the information_schema to pull out all fields with contacts
+   * Access the MySQL information_schema to scan for foreign key fields referencing civicrm_contact.id
    * 
    * This function supports deduping by providing a complete list
    * of all tables in the schema - even if CiviCRM does not know about them!
@@ -484,45 +504,113 @@ sql;
    * Assumes all data is found in a single schema.
    * @uses AgcAutoMerge::schema to determine the database schema to look in
    * @param boolean $clear_cache maybe useful if adding tables or testing
-   * @uses $_SESSION to cache results
-   * @return array of (schema_name).(table name).(key field) 
+   * @return array of (table name).(key field) 
    */
   static public function getContactKeyFields($clear_cache = false) {
     // check for cached table list:
     if ($clear_cache || !array_key_exists('_agc.dedupefields',$_SESSION)) {
-      $schema = AgcAutoMerge::schema();
-      $includeColumnsSQL = AgcAutoMerge::includeColumnsSQL();
-      $ignoreColumnsSQL = AgcAutoMerge::ignoreColumnsSQL();
-      $excludeEntitiesSQLList = AgcAutoMerge::excludeEntitiesSQLList();
-      // 1 find tables with 'contact_id' as a field
-      // todo verify this sql finds all foreign keys into civicrm_contact.id
-      // and tables with 'entity_id' as a field
-      $sql = <<<sql
-        SELECT concat(
-          `TABLE_SCHEMA`, '.',
-          `TABLE_NAME`, '.',
-          `COLUMN_NAME`) as value
-        FROM information_schema.COLUMNS
-        WHERE ($includeColumnsSQL) 
-          AND NOT ($ignoreColumnsSQL)
-          AND `TABLE_SCHEMA` = '$schema'
-sql;
-      $FieldList['includes'] = AgcAutoMerge::sqlToArray($sql);
-      // add in the root table:
-      $FieldList['includes'][] = "$schema.civicrm_contact.id";
-      // 3 remove civi custom tables where entity_id is not a contact
-      $sql = <<<sql
-        SELECT concat('$schema.',`table_name`, '.entity_id') as value
-        FROM au_drupal.civicrm_custom_group
-        WHERE `extends` IN ($excludeEntitiesSQLList)
-sql;
-      $FieldList['excludes'] = AgcAutoMerge::sqlToArray($sql);
-      $_SESSION['_agc.dedupefields'] = 
-        array_diff( $FieldList['includes'], 
-          $FieldList['excludes'] , AgcAutoMerge::ignore_list($schema));
+      AgcAutoMerge::prepareContactKeyFields();
     }
     return $_SESSION['_agc.dedupefields']; 
   }
+  /**
+   * Returns an SQL where clause for a contact related table.
+   *
+   * Uses $_SESSION['_agc.compound_key_partners'] to determine if $key is simple or compound,
+   * then builds a simple or compound join accordingly.
+   *
+   * Assumes that prepareContactKeyFields() has been called
+   *
+   * @param int $contact_id
+   * @param string $table
+   * @param string $key field
+   * @param string $alias SQL table alias (required because some queries compare two records in the same table)
+   * @return string SQL fragment
+   */
+  static public function whereClauseSQL($contact_id, $table, $key_field, $alias = '') {
+    $x = '_agc.compound_key_partners'; // session key to compound key secondary field list
+    // construct proper SQL alias. If no alias use table name
+    $alias = ($alias ? $alias : $table ) . '.';
+    // create (table).(field) string for referencing meta-data
+    $key ="$table.$key_field";
+    // construct and returen SQL
+    return "($alias$key_field = $contact_id" . 
+      ( array_key_exists($key,$_SESSION[$x])
+      ? " /* AND $_SESSION[$x][$key] = 'civicrm_contact' */ )"
+      : ')');
+  }
+
+
+  /**
+   * Read table schema etc to prepare key list
+   * todo: consider making this is into a class constructor then change most functions from static
+   * @uses $_SESSION to cache results
+   */
+  static public function prepareContactKeyFields() {
+    $merger_keys = array(); // list of (table.columns) read from merger.php
+    $schema_keys = array(); // list of (table.columns) read from MySQL schema directly
+    //
+    // access foriegn keys defined by /crm/dedupe/merger.php:
+    //
+    civicrm_initialize();
+    require_once drupal_get_path('module', 'civicrm').'/../CRM/Dedupe/Merger.php';
+    $compound_key_partners = array(); // columns that = 'civicrm_contact' 
+    $refs = crm_dedupe_merger::cidrefs(); // simple keys
+    foreach ($refs as $table => $key_cols) {
+      foreach ($key_cols as $key_col) {
+        $merger_keys[] = "$table.$key_col";
+      }
+    }
+    $refs = crm_dedupe_merger::eidrefs(); // compound keys
+    foreach ($refs as $table => $key_cols) {
+      foreach ($key_cols as $table_field => $key_col) {
+        $key = "$table.$key_col";
+        $merger_keys[] = $key;
+        $compound_key_partners[$key] = $table_field;
+      }
+    }
+    //
+    // scan MySQL information_schema.COLUMNS for additional references:
+    //
+    // read settings
+    $schema = AgcAutoMerge::schema();
+    $includeColumnsSQL = AgcAutoMerge::includeColumnsSQL();
+    $ignoreColumnsSQL = AgcAutoMerge::ignoreColumnsSQL();
+    $excludeEntitiesSQLList = AgcAutoMerge::excludeEntitiesSQLList();
+    // find tables with 'contact_id' etc as a field
+    $sql = <<<sql
+      SELECT concat(
+        /*`TABLE_SCHEMA`, '.', */
+        `TABLE_NAME`, '.',
+        `COLUMN_NAME`) as value
+      FROM information_schema.COLUMNS
+      WHERE ($includeColumnsSQL) 
+        AND NOT ($ignoreColumnsSQL)
+        AND `TABLE_SCHEMA` = '$schema'
+sql;
+    $schema_keys['includes'] = AgcAutoMerge::sqlToArray($sql);
+    // add in the root table:
+    $schema_keys['includes'][] = "civicrm_contact.id";
+    // remove civi custom tables where entity_id is not a contact
+    $sql = <<<sql
+      SELECT concat(`table_name`, '.entity_id') as value
+      FROM au_drupal.civicrm_custom_group
+      WHERE `extends` IN ($excludeEntitiesSQLList)
+sql;
+    $schema_keys['excludes'] = AgcAutoMerge::sqlToArray($sql);
+    //
+    // Combine keys from both mysql schema and code, then store:
+    //
+    $combined_keys = $merger_keys +
+        array_diff( $schema_keys['includes'], 
+          $schema_keys['excludes'] , AgcAutoMerge::ignore_list());
+    $_SESSION['_agc.dedupefields'] = array_unique($combined_keys);
+    // store compound key secondary columns:
+    $_SESSION['_agc.compound_key_partners'] = $compound_key_partners;
+  }
+
+
+
  /****************************************************************************/
  /* utilities **/
  /****************************************************************************/
@@ -536,13 +624,14 @@ sql;
       return array_pop($split); // = table
   }
    /**
-   * Parse long form column name into table name
-   * @param string column '(schema_name).(table name).(field)' 
-   * @return string '(schema_name).(table name)'
+   * Trim column name to leave a table reference
+   * @param string column '(schema_name).(table name).(field)' or  '(table name).(field)'
+   * @return string '(schema_name).(table name)' or '(table name)'
    */
   static public function tableFromColumnRef($long_column_name) {
       $split = explode('.',$long_column_name);
-      return $split[0].'.'.$split[1]; // = schema.table
+      array_pop($split);
+      return implode('.', $split); // = schema.table
   }
   
    /**
@@ -552,7 +641,7 @@ sql;
    */
   static public function field($long_column_name) {
       $split = explode('.',$long_column_name);
-      return $split[2]; // = field 
+      return array_pop($split); // = field 
   }
 
   /**
@@ -671,17 +760,19 @@ class AgcAutoMergeDevWindow {
   * @return array of field reports: result name [valueA]-[valueB] (test used)
   */
   public function examineRecord($table, $key_field, $ida, $idb) { 
-    $short_table_name = AgcAutoMerge::tableFromTableRef($table); // drop schema name from table reference
-    $columns = AgcAutoMerge::Describe($short_table_name);
+    $columns = AgcAutoMerge::Describe($table);
     $sql = "SELECT ";
     $columnsSQL = array();
     foreach ($columns as $c) {
-      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($short_table_name, $c);
-      $test = AgcAutoMerge::automergeSuitablilityTestSQL($short_table_name, $c, $behaviour);
+      $behaviour = AgcAutoMerge::columnAutomergeBehaviour($table, $c);
+      $test = AgcAutoMerge::automergeSuitablilityTestSQL($table, $c, $behaviour);
       $columnsSQL[] = " CONCAT_WS('', IF ($test, 'blocked', 'mergeable'), ' $c: [',ca.$c,']-[',cb.$c,'] ($behaviour)') AS $c";
     }
     $sql .= implode(', ', $columnsSQL);
-    $sql .= " FROM $table AS ca, $table AS cb WHERE ca.$key_field = $ida AND cb.$key_field = $idb;";
+    $sql .= " FROM $table AS ca, $table AS cb 
+              WHERE " .
+              AgcAutoMerge::whereClauseSQL($ida, $table, $key_field, 'ca') . ' AND ' .
+              AgcAutoMerge::whereClauseSQL($idb, $table, $key_field, 'cb') . ';';
     $res = CRM_Core_DAO::executeQuery($sql);
     $res->fetch();
     // fixme: this following line throws in a few extra properties and isn't a clean swayp for drupal's db_fetch_array()
@@ -711,3 +802,4 @@ class AgcAutoMergeDevWindow {
         return 'bad mode in agchtml::arrayFormat';}
   }
 }
+
