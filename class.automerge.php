@@ -4,7 +4,7 @@
 /**
 * @file
 *   Work in progress
-*   @author Erich Schulz (with help gratefully received from Xavier)
+*   @author Erich Schulz (with help gratefully received from Xavier and Lobo)
 *   given to the universe under the same licence as CiviCRM
 */
 
@@ -14,11 +14,9 @@
  *
  * The goal of these functions is to be simple but safe.
  *
- * Complex merges are rejected ('blocked') and will need handling through the UI
+ * Complex merges are rejected ('blocked') and will need handling through the UI. 
  *
- * The primary interface into the class is AgcAutoMerge::autoMergeSQL() which generates either:
- *    - the SQL to perform a merge, or 
- *    - a report explaining why the automerge is unsafe
+ * The primary interface into the class is merge()
  *  
  * Use AgcAutoMergeDevWindow::reportHtml() to see the internal workings 
  *
@@ -45,12 +43,12 @@
  * $_SESSION['_agc.compound_key_partners'] is an array where the index is a compound key referencing civcrm_contact.id.
  *  The value of this array is field name of the secondary column that indicates when the reference is to a contact.
  *
- * TODO:  Define the automerge behaviour of tables and fields in the datadictionary then...
+ * TODO:  Define the automerge behaviour of tables and fields in the datadictionary http://svn.civicrm.org/civicrm/trunk/xml/schema/ then...
  * TODO:  Rewrite the *_list functions and the columnAutomergeBehaviour functions to read the datadictionary 
  * TODO:  ideally this should be undoable - achievable if a list of updates is made and stored as a note attached to the 'deleted' contact
  * TODO:  Eliminate use of direct $_SESSION access
- * TODO:  Make the MySQL schema scan an optional action
- * TODO:  Make parameters configurable
+ * TODO:  Make the MySQL schema scan an optional action and move this code to a separated class
+ * TODO:  Make parameters reported by settings configurable
  */
 
 class AgcAutoMerge {
@@ -88,6 +86,57 @@ class AgcAutoMerge {
  /****************************************************************************/
 
   /**
+   * Automaticlly merge two contacts and attach a brief notes to both.
+   * 
+   * @see autoMergeSQL()
+   *
+   * @param $param array 
+   *  - 'id' integer contact_id of record to keep (injection attack safe)
+   *  - 'id_duplicate' integer contact_id of record to be assimilated (injection attack safe)
+   * @return array result including SQL
+   *  - is_error
+   *  - sql
+   *  - error_message
+   *  - report
+   */
+  static public function merge($param) {
+    $keep = (int)$param['id'];
+    $lose = (int)$param['id_duplicate'];
+    // attempt to generate SQL:
+    $result = AgcAutoMerge::autoMergeSQL($keep, $lose);
+    if (!$result['is_error']) {
+      // perform merge:
+      require_once 'CRM/Core/Transaction.php';
+      $transaction = new CRM_Core_Transaction( );
+      foreach ($result['sql'] as $sql) {
+        CRM_Core_DAO::executeQuery( $sql, CRM_Core_DAO::$_nullArray, true, null, true );
+      }
+      $transaction->commit( );
+      // add notes to both contacts: //todo fix note created by
+      $note = array( 
+        'entity_table' => 'civicrm_contact',
+        'entity_id' => $keep,
+        'note' => "This contact has been merged from the duplicate $lose",
+        'subject' => 'Target of automerge',
+        'version' => 3,
+      );
+      $result['report'] .= "Added note to $keep: ". json_encode(civicrm_api( 'note', 'create', $note));
+      $note = array( 
+        'entity_table' => 'civicrm_contact',
+        'entity_id' => $lose,
+        'note' => "This contact was merged to $keep",
+        'subject' => 'Duplicate. Deleted during automerge',
+        'version' => 3,
+      );
+     $result['report'] .=  "Added note to $lose: " . json_encode(civicrm_api( 'note','create', $note));
+    }
+    return $result;
+  }
+  
+  
+  
+  
+  /**
    * Attempt to produce SQL to automaticlly merge two contacts.
    * 
    * First checks both recordes exist and are not deleted, then scans the database looking for affected tables,
@@ -98,8 +147,13 @@ class AgcAutoMerge {
    * @param $otherId integer contact_id of record to be assimilated (injection attack safe)
    * @uses tablePlan()
    * @return array result including SQL
+   *  - is_error
+   *  - sql
+   *  - error_message
+   *  - report
    */
   static public function autoMergeSQL($mainId, $otherId) {
+    AgcAutoMerge::initialize();
     $keep = (int)$mainId;
     $lose = (int)$otherId;
     $result = array();
@@ -109,7 +163,7 @@ class AgcAutoMerge {
     $n = AgcAutoMerge::sqlToSingleValue(
       "SELECT count(*) AS value FROM civicrm_contact WHERE is_deleted = 0 AND id IN ($keep, $lose);");
     switch ($n) {
-      case 2: // 
+      case 2: // found 2 undeleted contacts ready for merging 
         // formulate a table-level plan for merging the contacts:
         $plan = AgcAutoMerge::tablePlan($otherId);
         if ($plan['blockers']) { // records found that are either in unknown tables or tables that need manual review
@@ -139,7 +193,7 @@ class AgcAutoMerge {
                 $updates = ", $updates";
               }
               $where = AgcAutoMerge::whereClauseSQL($lose, $table, $field);
-              $sql[] = "UPDATE $table SET $field = $keep$updates WHERE $where;";
+              $sql[] = "UPDATE IGNORE $table SET $field = $keep$updates WHERE $where;";
             }
             foreach ($plan['delete'] as $key) {
               $table = AgcAutoMerge::tableFromColumnRef($key);
@@ -228,7 +282,6 @@ class AgcAutoMerge {
     static $schema = '';
     if ( !$schema ) {
       civicrm_initialize();
-      //require_once drupal_get_path('module', 'civicrm').'/../api/api.php';
       $dsn = CRM_Core_Config::singleton()->dsn;
       // extract mysql database schema name from dsn string:
       // ie the bit between (the first / after the @) and the question mark
@@ -280,6 +333,7 @@ class AgcAutoMerge {
       "ems_regeocode.contact_id",
       "agc_known_duplicates.contact_id_a",
       "civicrm_log.entity_id", 
+      "civicrm_log.modified_id", 
     );
   }
  /**
@@ -318,7 +372,8 @@ class AgcAutoMerge {
       "civicrm_preferences.contact_id",
       "civicrm_uf_match.contact_id",
       "civicrm_value_fundraising_appeals_59.contact_id_298",
-      "ems_geocode_addr_electorate.contact_id  ",
+      "ems_geocode_addr_electorate.contact_id",
+      "civicrm_note.entity_id" 
     );
 
   }
@@ -455,7 +510,7 @@ class AgcAutoMerge {
         $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%')";
         break;
       case 'AllowSingleCharBlankOrMatch':
-        $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%') 
+        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'')
                 AND UPPER(SUBSTR(ca.$column,1,1))<>UPPER(cb.$column)";
         break;
       case 'IgnoreEMailOrTruncation':
@@ -519,8 +574,6 @@ sql;
    * Uses $_SESSION['_agc.compound_key_partners'] to determine if $key is simple or compound,
    * then builds a simple or compound join accordingly.
    *
-   * Assumes that prepareContactKeyFields() has been called
-   *
    * @param int $contact_id
    * @param string $table
    * @param string $key field
@@ -529,6 +582,10 @@ sql;
    */
   static public function whereClauseSQL($contact_id, $table, $key_field, $alias = '') {
     $x = '_agc.compound_key_partners'; // session key to compound key secondary field list
+    // initialise if not done yet:
+    if ($clear_cache || !array_key_exists($x, $_SESSION)) {
+      AgcAutoMerge::prepareContactKeyFields();
+    }
     // construct proper SQL alias. If no alias use table name
     $alias = ($alias ? $alias : $table ) . '.';
     // create (table).(field) string for referencing meta-data
@@ -536,24 +593,31 @@ sql;
     // construct and returen SQL
     return "($alias$key_field = $contact_id" . 
       ( array_key_exists($key,$_SESSION[$x])
-      ? " /* AND $_SESSION[$x][$key] = 'civicrm_contact' */ )"
+      ? " AND {$_SESSION[$x][$key]} = 'civicrm_contact' )"
       : ')');
   }
 
+  /**
+   * todo: consider making this is into a class constructor then change most functions from static
+   */
+  static public function initialize()  {
+    civicrm_initialize();
+    require_once drupal_get_path('module', 'civicrm').'/../api/api.php';
+    require_once drupal_get_path('module', 'civicrm').'/../CRM/Dedupe/Merger.php';
+  }
 
   /**
    * Read table schema etc to prepare key list
-   * todo: consider making this is into a class constructor then change most functions from static
+   * todo: consider moving this is into a class constructor then change most functions from static
    * @uses $_SESSION to cache results
    */
   static public function prepareContactKeyFields() {
+    AgcAutoMerge::initialize();
     $merger_keys = array(); // list of (table.columns) read from merger.php
     $schema_keys = array(); // list of (table.columns) read from MySQL schema directly
     //
     // access foriegn keys defined by /crm/dedupe/merger.php:
     //
-    civicrm_initialize();
-    require_once drupal_get_path('module', 'civicrm').'/../CRM/Dedupe/Merger.php';
     $compound_key_partners = array(); // columns that = 'civicrm_contact' 
     $refs = crm_dedupe_merger::cidrefs(); // simple keys
     foreach ($refs as $table => $key_cols) {
@@ -588,22 +652,22 @@ sql;
         AND NOT ($ignoreColumnsSQL)
         AND `TABLE_SCHEMA` = '$schema'
 sql;
-    $schema_keys['includes'] = AgcAutoMerge::sqlToArray($sql);
+    $schema_keys_includes = AgcAutoMerge::sqlToArray($sql);
     // add in the root table:
-    $schema_keys['includes'][] = "civicrm_contact.id";
+    $schema_keys_includes[] = "civicrm_contact.id";
     // remove civi custom tables where entity_id is not a contact
     $sql = <<<sql
       SELECT concat(`table_name`, '.entity_id') as value
       FROM au_drupal.civicrm_custom_group
       WHERE `extends` IN ($excludeEntitiesSQLList)
 sql;
-    $schema_keys['excludes'] = AgcAutoMerge::sqlToArray($sql);
+    $schema_keys_excludes = AgcAutoMerge::sqlToArray($sql);
     //
     // Combine keys from both mysql schema and code, then store:
     //
-    $combined_keys = $merger_keys +
-        array_diff( $schema_keys['includes'], 
-          $schema_keys['excludes'] , AgcAutoMerge::ignore_list());
+    $combined_keys = array_diff( 
+        $merger_keys + array_diff( $schema_keys_includes, $schema_keys_excludes ),
+        AgcAutoMerge::ignore_list());
     $_SESSION['_agc.dedupefields'] = array_unique($combined_keys);
     // store compound key secondary columns:
     $_SESSION['_agc.compound_key_partners'] = $compound_key_partners;
@@ -686,9 +750,10 @@ class AgcAutoMergeDevWindow {
   static function reportHtml($mainId, $otherId) {
     $keep = (int)$mainId;
     $lose = (int)$otherId;
-    return AgcAutoMergeDevWindow::explainPlanHtml($keep, $lose) . 
-      '<p>(The above explains how the folowing plan was constructed).</p></hr>' .
+    return 
       AgcAutoMergeDevWindow::showPlanHtml($keep, $lose) .
+      '<p>(The above plan was constructed based on the following logic).</p></hr>' .
+      AgcAutoMergeDevWindow::explainPlanHtml($keep, $lose) . 
       "<h4>Settings</h4>" . // show configuration
         json_encode(AgcAutoMerge::settings());
   } 
@@ -796,7 +861,8 @@ class AgcAutoMergeDevWindow {
       case 'sul':
       case 'sol':
         $t=($mode=='sul' ? 'u' : 'o');
-        return "<{$t}l><li>".implode($a,'</li><li>')."</li></{$t}l>";
+        return // json_encode($a).
+           "<{$t}l><li>".implode($a,'</li><li>')."</li></{$t}l>";
         break;
       default:
         return 'bad mode in agchtml::arrayFormat';}
