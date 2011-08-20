@@ -4,7 +4,7 @@
 /**
 * @file
 *   Work in progress
-*   @author Erich Schulz (with help gratefully received from Xavier and Lobo)
+*   @author Erich Schulz (with help gratefully received from Xavier and Lobo and Eileen)
 *   given to the universe under the same licence as CiviCRM
 */
 
@@ -18,7 +18,7 @@
  *
  * The primary interface into the class is merge()
  *  
- * Use AgcAutoMergeDevWindow::reportHtml() to see the internal workings 
+ * Use AgcAutoMergeDevWindow::reportHtml() to see the internal workings for debugging and development purposes
  *
  *  getContactKeyFields() scans the database to build a list of columns referencing contact_id
  *    - using the table information_schema.COLUMNS and
@@ -291,7 +291,10 @@ class AgcAutoMerge {
   }
 
   /**
-  * Pattern matching criteria for columns to include in initial scan of schema 
+  * Pattern matching criteria for columns to look for during initial scan of schema for unknown (user-created) tables
+  *
+  * Should match field names of the MySQL meta-data table information_schema.COLUMNS
+  * @see ignoreColumnsSQL()
   * fixme: this data belongs as a configurable core setting
   * @return string SQL clause to filter tables from a scan of the database schema
   */
@@ -299,16 +302,24 @@ class AgcAutoMerge {
     return "((`COLUMN_NAME` LIKE '%contact_id%') OR (`COLUMN_NAME` LIKE '%entity_id%') OR (`COLUMN_NAME` = '%employer_id%'))";
   }
   /**
-  * Pattern matching criteria for columns to ignore completely while auto deduping.
+  * Pattern matching criteria for columns to exclude from scan of database schema for unknown (user-created) tables.
+  *
+  * Should match field names of the MySQL meta-data table information_schema.COLUMNS
+  * @see includeColumnsSQL()
   * fixme: this data belongs as a configurable core setting
   * @return string SQL clause to filter tables from a scan of the database schema
   */
   public function ignoreColumnsSQL() { 
-    return "(TABLE_NAME LIKE '%_cache') OR (TABLE_NAME LIKE 'temp_%') OR (TABLE_NAME LIKE 'civicrm_import_job_%')";
+    return "(TABLE_NAME LIKE '%_cache') OR (TABLE_NAME LIKE 'temp_%') OR (TABLE_NAME LIKE 'aa%')   OR (TABLE_NAME LIKE '%_bak2%') OR (TABLE_NAME LIKE 'civicrm_import_job_%')";
   }
   /**
-  * List of entities to ignore completely while auto deduping.
-  * fixme: this data belongs as a configurable core setting
+  * List of custom CiviCRM data entities to ignore while auto deduping.
+  *
+  * This list is used to filter out entitity_id references to non-contacts defined in civicrm_custom_group.
+  *
+  * It should match the list of option in the `extends` collumn
+  *
+  * fixme: this data belongs as a configurable core setting, or better yet as some form of meta data
   * @return string single quoted, comma separated list of CiviCRM entities that are not contacts
   */
   public function excludeEntitiesSQLList() {
@@ -320,25 +331,31 @@ class AgcAutoMerge {
  /****************************************************************************/
 
   /**
+-         
+
+   * 
   * List of columns to ignore completely while auto deduping.
   * Any reference to redundant contacts are left alone.
-  * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
+  * fixme: most of this data belongs in the core civicrm datadictionary and should be read from there.
   * @return array of (table name).(key field) 
   */
   public function ignore_list() { 
     return array(
       "agc_known_duplicates.contact_id_b",
+      "tmp_backup_civicrm_value_electorates.entity_id",
       "civicrm_value_electorates.entity_id",
       "ems_geocode_addr_electorate.contact_id",
       "ems_regeocode.contact_id",
       "agc_known_duplicates.contact_id_a",
       "civicrm_log.entity_id", 
+      "civicrm_value_link_to_appeal_data_62",
       "civicrm_log.modified_id", 
+      "civicrm_value_donation_appeal_asks_30",
     );
   }
  /**
   * List of columns where a duplicate id should trigger a record delete during automated merging
-  * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
+  * fixme: most of this data belongs in the core civicrm datadictionary and should be read from there.
   *
   * @return array of (table name).(key field) 
   */
@@ -349,7 +366,7 @@ class AgcAutoMerge {
   }
  /**
   * List of columns that it is safe to update during an automated merge:
-  * fixme: this data belongs in the core civicrm datadictionary and should be read from there.
+  * fixme: most of this data belongs in the core civicrm datadictionary and should be read from there.
   * @return array of (table name).(key field) 
   */
   public function update_list() { 
@@ -373,7 +390,8 @@ class AgcAutoMerge {
       "civicrm_uf_match.contact_id",
       "civicrm_value_fundraising_appeals_59.contact_id_298",
       "ems_geocode_addr_electorate.contact_id",
-      "civicrm_note.entity_id" 
+      "civicrm_note.entity_id",
+      "civicrm_value_fundraising_appeals_59"
     );
 
   }
@@ -414,11 +432,8 @@ class AgcAutoMerge {
         case 'last_name':
           $behaviour = 'IgnoreTruncation';
           break;
-        //case 'sort_name':
-        //case 'display_name':
-          $behaviour = 'IgnoreEMaiTurrubal, Jagera and YuggeralOrTruncation';
-          break;
         case 'sort_name': // todo consider making more sophisticate opotion to compare for hand-crafted values
+        case 'external_identifier':
         case 'display_name': //todo see above
         case 'hash':
         case 'id':
@@ -475,14 +490,15 @@ class AgcAutoMerge {
     foreach ($columns as $column) {
       $behaviour = AgcAutoMerge::columnAutomergeBehaviour($table, $column);
       $sql .= '  IF ('.AgcAutoMerge::automergeSuitablilityTestSQL($table, $column, $behaviour) . 
-        ", CONCAT('$column /*',ca.$column,'-',cb.$column,'*/'), NULL),\n";
+        ", NULL, CONCAT('$column /*',IFNULL(ca.$column,'null'),'-',IFNULL(cb.$column,'null'),'*/')),\n";
     }
     $sql .= "  null) AS value
     FROM $table AS ca, $table AS cb 
     WHERE " .
       AgcAutoMerge::whereClauseSQL($ida, $table, $key_field, 'ca') . ' AND ' .
       AgcAutoMerge::whereClauseSQL($idb, $table, $key_field, 'cb') . ';';
-    $value = AgcAutoMerge::sqlToSingleValue($sql);
+    $value = //"<pre>$sql</pre>".
+       AgcAutoMerge::sqlToSingleValue($sql);
     return $value;
   }
 
@@ -494,31 +510,31 @@ class AgcAutoMerge {
  * Tables to compare are aliased by 'ca' and 'cb'.
  *
  * @see columnAutomergeBehaviour()
- * @returns string SQL clause evaluating to TRUE or FALSE if column fails automerge suitability test
+ * @returns string SQL clause (BOOLEAN) evaluating column automerge suitability 
  */
   function automergeSuitablilityTestSQL($table, $column, $behaviour) {
     $verbose = false; // set true to put debugging comments into SQL
     $emailRE = '^[0-9a-z_\.-]+@(([0-9]{1,3}\.){3}[0-9]{1,3}|([0-9a-z][0-9a-z-]*[0-9a-z]\.)+[a-z]{2,3})$';
     switch ($behaviour) {
       case 'BlockOnDifferentValue':
-        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'')";
+        $sql="IFNULL(cb.$column,'')='' OR IFNULL(cb.$column,'')=IFNULL(ca.$column,'')";
         break;
       case 'BlockIfGreater':
-        $sql="IFNULL(cb.$column,0)>IFNULL(ca.$column,0)";
+        $sql="IFNULL(cb.$column,0) <= IFNULL(ca.$column,0)";
         break;
       case 'IgnoreTruncation':
-        $sql="IFNULL(ca.$column,'') NOT LIKE CONCAT(IFNULL(cb.$column,''),'%')";
+        $sql="IFNULL(ca.$column,'') LIKE CONCAT(IFNULL(cb.$column,''),'%')";
         break;
       case 'AllowSingleCharBlankOrMatch':
-        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'')
-                AND UPPER(SUBSTR(ca.$column,1,1))<>UPPER(cb.$column)";
+        $sql="IFNULL(cb.$column,'') = '' OR IFNULL(cb.$column,'') = IFNULL(ca.$column,'')
+                OR UPPER(SUBSTR(ca.$column,1,1)) = UPPER(cb.$column)";
         break;
       case 'IgnoreEMailOrTruncation':
         // some fields may contain the emial address by default. This is pretty worthless so shouldn't force an automerge
-        $sql="IFNULL(cb.$column,'')<>'' AND IFNULL(cb.$column,'')<>IFNULL(ca.$column,'') AND cb.$column NOT REGEXP '$emailRE'";
+        $sql="IFNULL(cb.$column,'')='' OR IFNULL(cb.$column,'')=IFNULL(ca.$column,'') OR cb.$column REGEXP '$emailRE'";
         break;
       case 'Ignore':
-        $sql="FALSE";
+        $sql="TRUE";
         break;
     }
     return ($verbose ? "/* $table.$column: $behaviour */\n" : '') . $sql . "\n";
@@ -665,9 +681,12 @@ sql;
     //
     // Combine keys from both mysql schema and code, then store:
     //
-    $combined_keys = array_diff( 
-        $merger_keys + array_diff( $schema_keys_includes, $schema_keys_excludes ),
-        AgcAutoMerge::ignore_list());
+    $combined_keys = 
+      array_diff(
+        array_merge(
+          $merger_keys,
+          array_diff( $schema_keys_includes, $schema_keys_excludes )),
+      AgcAutoMerge::ignore_list());
     $_SESSION['_agc.dedupefields'] = array_unique($combined_keys);
     // store compound key secondary columns:
     $_SESSION['_agc.compound_key_partners'] = $compound_key_partners;
@@ -783,7 +802,7 @@ class AgcAutoMergeDevWindow {
             AgcAutoMergeDevWindow::examineRecord($table, $field, $keep, $lose),'sul');
         // report on actual function used to do the final check within autoMergeSQL()
         $final_check = AgcAutoMerge::CheckTwoRecordsForBlocksSQL($table,$field, $keep, $lose);
-        $html .= "<p>In summary: " .($final_check ? $final_check : "no blocks found on examination of $table") .  "</p>";
+        $html .= "<p>In summary:" .($final_check ? $final_check : "no blocks found on examination of $table") .  "</p>";
       }
     }
     if ($plan['update']) {
@@ -796,6 +815,10 @@ class AgcAutoMergeDevWindow {
     if ($plan['blockers']) {
       $html .= "<h4>Tables containing records blocking merge</h4>" . AgcAutoMergeDevWindow::arrayFormat($plan['blockers'],'sol').'<hr>';
     }
+    $html .= "<h3>List of scanned Contact Key Fields</h3><p>The automatic merge uses this list to search for references to contacts in the database</p>";
+    $fields =  AgcAutoMerge::getContactKeyFields($lose);
+    $html .= AgcAutoMergeDevWindow::arrayFormat($fields,'sol');
+    
   return $html;
   }
 
@@ -831,7 +854,7 @@ class AgcAutoMergeDevWindow {
     foreach ($columns as $c) {
       $behaviour = AgcAutoMerge::columnAutomergeBehaviour($table, $c);
       $test = AgcAutoMerge::automergeSuitablilityTestSQL($table, $c, $behaviour);
-      $columnsSQL[] = " CONCAT_WS('', IF ($test, 'blocked', 'mergeable'), ' $c: [',ca.$c,']-[',cb.$c,'] ($behaviour)') AS $c";
+      $columnsSQL[] = " CONCAT_WS('', IF ($test, 'mergeable', 'blocked'), ' $c: [',ca.$c,']-[',cb.$c,'] ($behaviour)') AS $c";
     }
     $sql .= implode(', ', $columnsSQL);
     $sql .= " FROM $table AS ca, $table AS cb 
@@ -847,7 +870,7 @@ class AgcAutoMergeDevWindow {
 
    /**
    * Format a one dimension php array into various styles depending on mode:
-   * 	- sol - simple ordered list
+   *  - sol - simple ordered list
    * 	- sul - simple unordered list
    * @param array $a 
    * @param string $mode 
